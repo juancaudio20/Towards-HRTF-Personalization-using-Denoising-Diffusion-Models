@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import math
-
+import numpy as np
 
 class DiffusionModel:
     def __init__(self, start_schedule=0.0001, end_schedule=0.02, timesteps=300):
@@ -70,7 +70,6 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
-
 class Block(nn.Module):
     def __init__(self, channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding,
                  num_filters=3, downsample=True):
@@ -84,7 +83,9 @@ class Block(nn.Module):
         # self.head_measurement_embedding = nn.Linear(13, 128)
 
         if labels:
-            self.label_mlp = nn.Linear(1, channels_out)
+            #self.label_emb = nn.Linear(440, time_embedding_dims)
+            self.label_emb = nn.Embedding(labels, channels_out)
+            #self.label_mlp = nn.Linear(time_embedding_dims, channels_out)
 
         self.downsample = downsample
 
@@ -127,11 +128,19 @@ class Block(nn.Module):
         if self.ears_embedding:
             ear_meas = kwargs.get('ears_embedding')
             o_ears = self.ears_mlp(self.ears_measurement_embedding(ear_meas.float()))
-            # print("o_ears", o_ears.shape)
+            #print("o in ears", o.shape)
             o = o + o_ears.unsqueeze(2)
         if self.labels:
             label = kwargs.get('labels')
-            o_label = self.relu(self.label_mlp(label))
+            #o_label = self.relu(self.label_mlp(label))
+            #o_label = self.label_mlp(self.label_emb(label))
+            o_label = self.label_emb(label)
+            #if np.isnan(o_label.cpu().any()):
+                #print(o_label)
+            o_label = o_label.squeeze(1)
+            #o_label = o_label.permute(0,2,1)
+            #print("o in label", o.shape)
+            #print("label", o_label.shape)
             o = o + o_label.unsqueeze(2)
             # print(o)
 

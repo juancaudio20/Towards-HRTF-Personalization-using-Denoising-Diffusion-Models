@@ -5,6 +5,7 @@ import pandas as pd
 from torch.utils.data import Dataset
 from pysofaconventions import *
 import numpy as np
+import matplotlib.pyplot as plt
 
 class HUTUBSDataset(Dataset):
     def __init__(self, hrtf_directory, anthro_csv_path):
@@ -13,7 +14,7 @@ class HUTUBSDataset(Dataset):
         self.load_data()
 
     def load_data(self):
-        excluded_subjects = [18, 79, 92]
+        #excluded_subjects = [18, 79, 92]
         subject = []
 
         hrtf_points = []
@@ -34,6 +35,8 @@ class HUTUBSDataset(Dataset):
 
                 hrtf_point = hrtf_data[point, :, :]
                 hrtf_point = hrtf_point.data
+                #hrtf_point = hrtf_point[:, 20:128]
+                #print("hrtf_point:", hrtf_point.shape)
                 if np.isnan(hrtf_point.any()):
                     print(f"nan detected at subject: {n} point: {point}")
 
@@ -102,6 +105,20 @@ for idx in sorted(indices_to_remove, reverse=True):
     hutubs_dataset.normalized_dataset.pop(idx)
 
 
+subject_idx = 1
+measurement_point = 9
+
+data_point = hutubs_dataset[subject_idx * 440 + measurement_point]
+#print("HRTF shape: ", data_point['hrtf'].shape)
+#print("HRTF shape: ", data_point['hrtf'])
+
+#plt.figure(figsize=(14, 5))
+#plt.plot(data_point['hrtf'][0],label='L', linewidth=0.5, marker='o', markersize=1)
+#plt.plot(data_point['hrtf'][1],label='R', linewidth=0.5, marker='o', markersize=1)
+#plt.xlim([0,256])
+#plt.title(f'Subject: {data_point["subject_id"]}, Position: {data_point["measurement_point"]}')
+#plt.legend()
+#plt.show()
 
 def collate_fn(batch):
 
