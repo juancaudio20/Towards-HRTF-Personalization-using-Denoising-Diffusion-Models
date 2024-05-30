@@ -2,56 +2,65 @@ import torch
 from torch import nn
 import math
 import numpy as np
+from tqdm import tqdm
+
+
 
 class DiffusionModel:
-    def __init__(self, start_schedule=0.0001, end_schedule=0.02, timesteps=300):
-        self.start_schedule = start_schedule
-        self.end_schedule = end_schedule
-        self.timesteps = timesteps
+    def __init__(self, noise_steps=300, beta_start=0.0001, beta_end=0.02, device="cuda"):
+        self.noise_steps = noise_steps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+
+        self.beta = self.prepare_noise_schedule().to(device)
+        self.alpha = 1. - self.beta
+        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+
+        self.device = device
+    def prepare_noise_schedule(self):
+        return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+
+    def forward(self, x, t):
+        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None]
+        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None]
+        Ɛ = torch.randn_like(x)
+        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
+
+    def sample_timesteps(self, n):
+        return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
 
-        self.betas = torch.linspace(start_schedule, end_schedule, timesteps)
-        self.alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-
-    def forward(self, x_0, t, device="cpu"):
-
-        noise = torch.randn_like(x_0)
-        sqrt_alphas_cumprod_t = self.get_index_from_list(self.alphas_cumprod.sqrt(), t, x_0.shape)
-        sqrt_one_minus_alphas_cumprod_t = self.get_index_from_list(torch.sqrt(1. - self.alphas_cumprod), t, x_0.shape)
-
-        mean = sqrt_alphas_cumprod_t.to(device) * x_0.to(device)
-        variance = sqrt_one_minus_alphas_cumprod_t.to(device) * noise.to(device)
-
-        return mean + variance, noise.to(device)
-
-    @torch.no_grad()
-    def backward(self, x, t, model, **kwargs):
-
+    def backward(self, x, model, **kwargs):
         labels = kwargs.get('labels', None)
         head_embedding = kwargs.get('head_embedding', None)
         ears_embedding = kwargs.get('ears_embedding', None)
-        betas_t = self.get_index_from_list(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = self.get_index_from_list(torch.sqrt(1. - self.alphas_cumprod), t, x.shape)
-        sqrt_recip_alphas_t = self.get_index_from_list(torch.sqrt(1.0 / self.alphas), t, x.shape)
-        denoise_model = model(x, t, labels=labels, head_embedding=head_embedding, ears_embedding=ears_embedding)
-        # print("model out:", denoise_model)
-        mean = sqrt_recip_alphas_t * (x - betas_t * denoise_model / sqrt_one_minus_alphas_cumprod_t)
-        # mean = sqrt_recip_alphas_t * (x - betas_t * model(x, t, **kwargs) / sqrt_one_minus_alphas_cumprod_t)
-        posterior_variance_t = betas_t
-
-        if t == 0:
-            return mean
-        else:
-            noise = torch.randn_like(x)
-            variance = torch.sqrt(posterior_variance_t) * noise
-            return mean + variance
-
+        cfg_scale = 1
+        model.eval()
+        with torch.no_grad():
+            #x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
+                t = (torch.ones(len(labels)) * i).long().to(self.device)
+                predicted_noise = model(x, t, labels=labels, head_embedding=head_embedding, ears_embedding=ears_embedding)
+                if cfg_scale > 0:
+                    uncond_predicted_noise = model(x, t, labels=None, head_embedding=None, ears_embedding=None)
+                    predicted_noise = torch.lerp(uncond_predicted_noise, predicted_noise, cfg_scale)
+                alpha = self.alpha[t][:, None, None]
+                alpha_hat = self.alpha_hat[t][:, None, None]
+                beta = self.beta[t][:, None, None]
+                if i > 1:
+                    noise = torch.randn_like(x)
+                else:
+                    noise = torch.zeros_like(x)
+                x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+        return x
     @staticmethod
     def get_index_from_list(values, t, x_shape):
         batch_size = t.shape[0]
         out = values.gather(-1, t.long().cpu())
         return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
+
+
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -70,9 +79,12 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
+
+
+
 class Block(nn.Module):
     def __init__(self, channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding,
-                 num_filters=3, downsample=True):
+                 num_filters=3, downsample=True, dropout_prob=0.0):
         super().__init__()
 
         self.time_embedding_dims = time_embedding_dims
@@ -80,12 +92,9 @@ class Block(nn.Module):
         self.labels = labels
         self.head_embedding = head_embedding
         self.ears_embedding = ears_embedding
-        # self.head_measurement_embedding = nn.Linear(13, 128)
 
         if labels:
-            #self.label_emb = nn.Linear(440, time_embedding_dims)
             self.label_emb = nn.Embedding(labels, channels_out)
-            #self.label_mlp = nn.Linear(time_embedding_dims, channels_out)
 
         self.downsample = downsample
 
@@ -103,73 +112,98 @@ class Block(nn.Module):
         self.time_mlp = nn.Linear(time_embedding_dims, channels_out)
 
         if ears_embedding:
-            self.ears_measurement_embedding = nn.Linear(24, time_embedding_dims)
-            self.ears_mlp = nn.Linear(time_embedding_dims, channels_out)
+            self.ears_measurement_embedding = nn.Linear(12, channels_out)
 
         if head_embedding:
-            self.head_measurement_embedding = nn.Linear(13, time_embedding_dims)
-            self.head_mlp = nn.Linear(time_embedding_dims, channels_out)
-            # self.head_mlp = nn.Linear(13,time_embedding_dims)
+            self.head_measurement_embedding = nn.Linear(13, channels_out)
 
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout_prob)
 
     def forward(self, x, t, **kwargs):
         o = self.bnorm1(self.relu(self.conv1(x)))
         o_time = self.relu(self.time_mlp(self.time_embedding(t)))
         o = o + o_time.unsqueeze(2)
-        if self.head_embedding:
-            head_meas = kwargs.get('head_embedding')
-            # head_emb = self.head_measurement_embedding(head_meas)
-            o_head = self.head_mlp(self.head_measurement_embedding(head_meas.float()))
-            # o_head = self.head_mlp(head_meas.float())
-            # print("o head:", o_head.shape)
-            # print("o: ", o.shape)
+        head_meas = kwargs.get('head_embedding')
+        ear_meas = kwargs.get('ears_embedding')
+        label = kwargs.get('labels')
+        if head_meas is not None:
+            o_head = self.relu(self.head_measurement_embedding(head_meas))
             o = o + o_head.unsqueeze(2)
-        if self.ears_embedding:
-            ear_meas = kwargs.get('ears_embedding')
-            o_ears = self.ears_mlp(self.ears_measurement_embedding(ear_meas.float()))
-            #print("o in ears", o.shape)
+        if ear_meas is not None:
+            o_ears = self.relu(self.ears_measurement_embedding(ear_meas))
             o = o + o_ears.unsqueeze(2)
-        if self.labels:
-            label = kwargs.get('labels')
-            #o_label = self.relu(self.label_mlp(label))
-            #o_label = self.label_mlp(self.label_emb(label))
-            o_label = self.label_emb(label)
-            #if np.isnan(o_label.cpu().any()):
-                #print(o_label)
+        if label is not None:
+            o_label = self.relu(self.label_emb(label))
             o_label = o_label.squeeze(1)
-            #o_label = o_label.permute(0,2,1)
-            #print("o in label", o.shape)
-            #print("label", o_label.shape)
             o = o + o_label.unsqueeze(2)
-            # print(o)
+
+        o = self.dropout(self.bnorm2(self.relu(self.conv2(o))))
 
         return self.final(o)
 
 
 class UNet(nn.Module):
-    def __init__(self, audio_channels=2, time_embedding_dims=256, labels=False, head_embedding=False,
-                 ears_embedding=False, sequence_channels=(64, 128, 256, 512, 1024)):
+    def __init__(self, audio_channels=1, time_embedding_dims=128, labels=False, ears_embedding=False, head_embedding=False, sequence_channels=(4, 8, 16, 32, 64, 128, 256), dropout_prob=0.0):
         super().__init__()
         self.time_embedding_dims = time_embedding_dims
         sequence_channels_rev = reversed(sequence_channels)
 
         self.downsampling = nn.ModuleList(
-            [Block(channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding) for
+            [Block(channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding, dropout_prob=dropout_prob) for
              channels_in, channels_out in zip(sequence_channels, sequence_channels[1:])])
-        self.upsampling = nn.ModuleList([Block(channels_in, channels_out, time_embedding_dims, labels, head_embedding,
-                                               ears_embedding, downsample=False) for channels_in, channels_out in
+        self.upsampling = nn.ModuleList([Block(channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding, downsample=False, dropout_prob=dropout_prob) for channels_in, channels_out in
                                          zip(sequence_channels[::-1], sequence_channels[::-1][1:])])
         self.conv1 = nn.Conv1d(audio_channels, sequence_channels[0], 3, padding=1)
         self.conv2 = nn.Conv1d(sequence_channels[0], audio_channels, 1)
 
     def forward(self, x, t, **kwargs):
         residuals = []
+        #print("x", x.shape)
         o = self.conv1(x)
+        #print("o", o.shape)
         for ds in self.downsampling:
             o = ds(o, t, **kwargs)
             residuals.append(o)
         for us, res in zip(self.upsampling, reversed(residuals)):
+            #print("o",o.shape)
+            #print("res", res.shape)
             o = us(torch.cat((o, res), dim=1), t, **kwargs)
 
         return self.conv2(o)
+
+
+
+class EMA(object):
+    def __init__(self, mu=0.999):
+        self.mu = mu
+        self.shadow = {}
+
+    def register(self, module):
+        for name, param in module.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self, module):
+        for name, param in module.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].data = (1. - self.mu) * param.data + self.mu * self.shadow[name].data
+
+    def ema(self, module):
+        for name, param in module.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.shadow[name].data)
+
+    def ema_copy(self, module):
+        module_copy = type(module)(module.config).to(module.config.device)
+        module_copy.load_state_dict(module.state_dict())
+        self.ema(module_copy)
+        return module_copy
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict
+
+

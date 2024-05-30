@@ -1,6 +1,9 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import tqdm
+from spatialaudiometrics import hrtf_metrics as hm
+import os
 
 
 def plot_noise_distribution(noise, predicted_noise,epoch,plot_path=None):
@@ -45,48 +48,97 @@ def nmse(hrir_test, hrir_gen):
 
     return overall_nmse
 
+def plot_hrir(hrir_test, hrir_pred, position, id):
 
-def lsd(hrir_test, hrir_gen, points,sr, plot=False):
-
-    hrtf_array1 = []
-    hrtf_array2 = []
-
-    for point in range(points):
-        hrtf_test = np.fft.fft(hrir_test[point][0])
-        hrtf_gen = np.fft.fft(hrir_gen[point][0])
-        K = np.fft.fftfreq(len(hrtf_test), 1 / sr)
-
-        hrtf_array1.append(hrtf_gen)
-        hrtf_array2.append(hrtf_test)
-
-
-    H = np.array(hrtf_array1)
-    H_hat = np.array(hrtf_array2)
-
-    log_ratio = 20 * np.log10(np.abs(hrtf_array1) / np.abs(hrtf_array2))
-
-    squared_diffs = np.sum(log_ratio ** 2) / (points * len(K))
-    LSD = np.sqrt(squared_diffs)
+    plt.figure(figsize=(14, 5))
+    plt.plot(hrir_test[0], label='Sample', linestyle='dashed')
+    plt.plot(hrir_pred[0], label='Predicted')
+    plt.grid(True)
+    plt.legend()
+    plt.title(f'Left HRIR position: {position}')
+    plt.xlabel('Sample Idex')
+    plt.ylabel('Amplitude')
+    plt.savefig(f'/nas/home/jalbarracin/ddpm/results/img/sub_{id}/hrir_l_pos_{position}.jpg')
+    plt.close()
     '''
-    cumulative_LSD = np.zeros(K)
-    cumulative_LSD[0] = np.sqrt(np.sum(log_ratio[:, :1] ** 2) / (points * 1))
+    plt.figure(figsize=(14, 5))
+    plt.plot(hrir_test[1], label='Sample', linestyle='dashed')
+    plt.plot(hrir_pred[1], label='Predicted')
+    plt.grid(True)
+    plt.legend()
+    plt.title(f'Right HRIR position: {position}')
+    plt.xlabel('Sample Idex')
+    plt.ylabel('Amplitude')
+    plt.savefig(f'/nas/home/jalbarracin/ddpm/results/img/sub_{id}/hrir_r_pos_{position}.jpg')
+    plt.close()
+    '''
+def plot_hrtf(hrir_test, hrir_pred, id):
 
-    for i in range(1, K):
-        log_ratio_i = log_ratio[:, :i + 1]
-        squared_diffs_i = np.sum(log_ratio_i ** 2) / (points * (i + 1))
-        cumulative_LSD[i] = np.sqrt(squared_diffs_i)
+    print("test: ", hrir_test.shape)
+    print("pred: ", hrir_pred.shape)
+    hrtf_l_test = np.fft.fft(hrir_test[:,0])
+    hrtf_l_pred = np.fft.fft(hrir_pred[:,0])
 
-    frequency_axis = np.arange(1, K + 1) * (44100 / (2 * K))
+    bark_critical_bands = np.array(
+        [200, 300, 400, 510, 630, 770, 920, 1080, 1270, 1480, 1720, 2000, 2320, 2700,
+         3150, 3700, 4400, 5300, 6400, 7700, 9500, 12000, 15500])
 
-    if plot:
-        plt.figure(figsize=(10, 6))
-        plt.plot(frequency_axis, cumulative_LSD, linewidth=0.5)
-        plt.title('Cumulative LSD')
-        plt.xlabel('Frequency [Hz]')
-        plt.ylabel('Cumulative LSD [dB]')
-        plt.grid(True)
+
+    sam_lsd2, hola = hm.calculate_lsd_across_locations(np.array(hrir_test), np.array(hrir_pred), 44100)
+    
+    hrtf_l_test_db = 20 * np.log10(np.abs(hrtf_l_test))
+    hrtf_l_pred_db = 20 * np.log10(np.abs(hrtf_l_pred))
+
+    K = np.fft.fftfreq(len(hrtf_l_test[0]), 1 / 44100)
+
+    nearest_indices = np.array([np.abs(K - freq).argmin() for freq in bark_critical_bands])
+    hrtf_l_test_db_1 = hrtf_l_test_db[:,nearest_indices]
+    hrtf_l_pred_db_1 = hrtf_l_pred_db[:,nearest_indices]
+
+    positions = np.random.randint(36, size=10).astype(int)
+    #print(positions)
+
+    directory = f'/nas/home/jalbarracin/ddpm/results/img2/sub_{id}'
+    os.makedirs(directory, exist_ok=True)
+
+    for position in positions:
+
+        plt.figure(figsize=(14, 5))
+        plt.plot(K[:len(K) // 2], hrtf_l_test_db[position, :len(hrtf_l_test_db[position]) // 2], label='Test')
+        plt.plot(K[:len(K) // 2], hrtf_l_pred_db[position, :len(hrtf_l_pred_db[position]) // 2], label='Predicted')
+        plt.title(f'Left HRTF source position: {position}')
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel('Magnitude (dB)')
+        plt.xlim(20, 20000)
         plt.xscale('log')
-        plt.show()
-    '''
-    return LSD
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(f'/nas/home/jalbarracin/ddpm/results/img2/sub_{id}/hrtf_l_pos_{position}_all.jpg')
+        plt.close()
+
+        plt.figure(figsize=(14, 5))
+        plt.plot(hrir_pred[position, 0], label='Predicted')
+        plt.plot(hrir_test[position,0], label='Sample', linestyle='dashed')
+        plt.grid(True)
+        plt.legend()
+        plt.title(f'Left HRIR position: {position}')
+        plt.xlabel('Sample Idex')
+        plt.ylabel('Amplitude')
+        plt.savefig(f'/nas/home/jalbarracin/ddpm/results/img2/sub_{id}/hrir_l_pos_{position}.jpg')
+        plt.close()
+
+    return hrtf_l_pred_db_1, hrtf_l_test_db_1, sam_lsd2
+
+
+
+
+def error_freq(hrir_pred, hrir_test):
+
+    ratio = (hrir_pred.float() - hrir_test.float()) ** 2
+
+    return ratio
+
+
+
+
 

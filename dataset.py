@@ -7,130 +7,152 @@ from pysofaconventions import *
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 class HUTUBSDataset(Dataset):
-    def __init__(self, hrtf_directory, anthro_csv_path):
+    def __init__(self, hrtf_directory, anthro_csv_path, val_sub_idx):
         self.hrtf_directory = hrtf_directory
         self.anthro_csv_path = anthro_csv_path
+        self.val_sub_idx = val_sub_idx
         self.load_data()
 
     def load_data(self):
         #excluded_subjects = [18, 79, 92]
         subject = []
-
+        angles = set()
         hrtf_points = []
+        hrtf_lo = []
         for n in range(1, 97):
-
-
             file_path = os.path.join(self.hrtf_directory, f'pp{n}_HRIRs_measured.sofa')
 
             sofa = SOFAFile(file_path, 'r')
             sourcePositions = sofa.getVariableValue('SourcePosition')
+            #print("Source Positions")
+            #print(sourcePositions)
             subject.append(sofa)
-
+        m = 0
+        mn = 0
         for n, sofa_file in enumerate(subject):
-            # print("sub: ", n)
-            hrtf_data = sofa_file.getDataIR()
-            for point in range(440):
-                p = sourcePositions[point, 1]
+            angle = 0
+            if n not in {17, 78, 91, self.val_sub_idx}:
+                m += 1
+                hrtf_data = sofa_file.getDataIR()
+                for point in range(440):
+                    p = sourcePositions[point]
+                    azimuth = p[0]
+                    elevation = p[1]
+                    if elevation ==0:
+                        angle +=1
+                        hrtf_point = hrtf_data[point, :, :]
+                        hrtf_point = hrtf_point.data
+                        if np.isnan(hrtf_point.any()):
+                            print(f"nan detected at subject: {n} point: {point}")
+                        hrtf_points.append({'hrtf': hrtf_point, 'point': angle, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': m})
 
-                hrtf_point = hrtf_data[point, :, :]
-                hrtf_point = hrtf_point.data
-                #hrtf_point = hrtf_point[:, 20:128]
-                #print("hrtf_point:", hrtf_point.shape)
-                if np.isnan(hrtf_point.any()):
-                    print(f"nan detected at subject: {n} point: {point}")
+            if n == self.val_sub_idx:
+                 mn += 1
+                 hrtf_data = sofa_file.getDataIR()
+                 for point in range(440):
+                    p = sourcePositions[point]
+                    azimuth = p[0]
+                    elevation = p[1]
+                    if elevation == 0:
+                        angle += 1
+                        #print(angle)
+                        #angles.add(azimuth)
+                        #print(len(angles))
+                        #print(azimuth)
+                        #print(elevation)
+                        hrtf_point = hrtf_data[point, :, :]
+                        hrtf_point = hrtf_point.data
+                        if np.isnan(hrtf_point.any()):
+                            print(f"nan detected at subject: {n} point: {point}")
+                        hrtf_lo.append({'hrtf': hrtf_point, 'point': angle, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': mn})
 
-                hrtf_points.append({'hrtf': hrtf_point, 'point': point, 'subj': n})
 
         self.all_hrtf_data = torch.from_numpy(np.array([item['hrtf'] for item in hrtf_points]))
-        self.all_hrtf_points = torch.from_numpy(np.array([item['point'] for item in hrtf_points]))
-
-        self.global_mean = torch.mean(self.all_hrtf_data)
-        self.global_std = torch.std(self.all_hrtf_data)
+        self.lo_hrtf_data = torch.from_numpy(np.array([item['hrtf'] for item in hrtf_lo]))
+        self.combined_hrtf_data = torch.cat((self.all_hrtf_data, self.lo_hrtf_data), dim=0)
+        self.global_mean = torch.mean(self.combined_hrtf_data)
+        self.global_std = torch.std(self.combined_hrtf_data)
 
         af_csv = pd.read_csv(self.anthro_csv_path, header=0)
-        # af_csv_filtered = af_csv[~af_csv['SubjectID'].isin(excluded_subjects)]
-        self.subject_ids = torch.from_numpy(af_csv.iloc[:, 0].values)
-        # print("sub size: ", self.subject_ids)
-        self.head_measurements = torch.from_numpy(af_csv.iloc[:, 1:14].values)
-        # self.head_measurements = self.head_measurements[~af_csv['SubjectID'].isin(excluded_subjects)]
-        # print("head: ", self.head_measurements)
-        self.ear_measurements = torch.from_numpy(af_csv.iloc[:, 14:].values)
-        # self.ear_measurements = self.ear_measurements[~af_csv['SubjectID'].isin(excluded_subjects)]
-        # print("NaN in Head Measurements:", torch.isnan(self.head_measurements).any())
-        self.head_measurements[torch.isnan(self.head_measurements)] = 0
-        self.ear_measurements[torch.isnan(self.ear_measurements)] = 0
-        # print("NaN in Head Measurements:", torch.isnan(self.head_measurements).any())
-        self.global_head_mean = torch.mean(self.head_measurements)
-        self.global_head_std = torch.std(self.head_measurements)
-        self.global_ears_mean = torch.mean(self.ear_measurements)
-        self.global_ears_std = torch.std(self.ear_measurements)
+        self.sub_lo = torch.tensor(af_csv.iloc[self.val_sub_idx, 0])
+        self.head_lo = torch.from_numpy(af_csv.iloc[self.val_sub_idx, 1:14].values)
+        self.ears_lo = torch.from_numpy(af_csv.iloc[self.val_sub_idx, 26:].values)
+        subs_to_delete = torch.tensor([17, 78, 91])
+        self.subject_ids = torch.from_numpy(np.delete(af_csv.iloc[:, 0].values, subs_to_delete, axis=0))
+        #print(len(self.subject_ids))
+        #print(self.subject_ids)
+        self.head_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 1:14].values, subs_to_delete, axis=0))
+        self.ear_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 26:].values, subs_to_delete, axis=0))
+        self.anthro_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 1:].values, subs_to_delete, axis=0))
+        self.anthro_mean = torch.mean(self.anthro_measurements)
+        self.anthro_std = torch.std(self.anthro_measurements)
+        #self.global_head_mean = torch.mean(self.head_measurements)
+        #self.global_head_std = torch.std(self.head_measurements)
+        #self.global_ears_mean = torch.mean(self.ear_measurements)
+        #self.global_ears_std = torch.std(self.ear_measurements)
 
         self.normalized_dataset = [
             {
                 'hrtf': (torch.from_numpy(item['hrtf']) - self.global_mean) / self.global_std,
+                'point': item['point'],
                 'subject_id': item['subj'] + 1,
-                'measurement_point': item['point'],
-                'head_measurements': (self.head_measurements[self.subject_ids[item[
-                    'subj']] - 1] - self.global_head_mean) / self.global_head_std,
-                'ear_measurements': (self.ear_measurements[self.subject_ids[item[
-                    'subj']] - 1] - self.global_ears_mean) / self.global_ears_std,
+                'azimuth': item['azimuth'],
+                'elevation': item['elevation'],
+                'head_measurements': torch.reciprocal(1 + torch.exp((self.head_measurements[item['subj_2'] - 1] - self.anthro_mean)/ self.anthro_std)),
+                'ear_measurements': torch.reciprocal(1 + torch.exp((self.ear_measurements[item['subj_2'] - 1] - self.anthro_mean)/ self.anthro_std)),
                 'global_std': self.global_std,
-                'global_mean': self.global_mean,
+                'global_mean': self.global_mean
             }
 
             for item in hrtf_points
         ]
 
+        self.leave_out_subject = [
+
+            {
+            'hrtf': (torch.from_numpy(item['hrtf']) - self.global_mean) / self.global_std,
+            'point': item['point'],
+            'subject_id': item['subj'] + 1,
+            'azimuth': item['azimuth'],
+            'elevation': item['elevation'],
+            'head_measurements': torch.reciprocal(
+                1 + torch.exp((self.head_lo - self.anthro_mean) / self.anthro_std)),
+            'ear_measurements': torch.reciprocal(
+                1 + torch.exp((self.ears_lo - self.anthro_mean) / self.anthro_std)),
+            'global_std': self.global_std,
+            'global_mean': self.global_mean
+            }
+            for item in hrtf_lo
+        ]
+
     def __len__(self):
-        return len(self.normalized_dataset)
+        return len(self.normalized_dataset), len(self.leave_out_subject)
 
     def __getitem__(self, idx):
-        return self.normalized_dataset[idx]
+        if idx == 0:
+            return self.normalized_dataset
 
-hutubs_dataset = HUTUBSDataset(
-    hrtf_directory='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs',
-    anthro_csv_path='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv'
-)
+        elif idx == 1:
+            return self.leave_out_subject
 
-
-indices_to_remove = []
-for n in range(92):
-    for p in range(440):
-        hutubs_inspect = hutubs_dataset[n * 440 + p]
-        if hutubs_inspect['subject_id'] in [18,79,92]:
-            indices_to_remove.append(n * 440 + p)
-
-for idx in sorted(indices_to_remove, reverse=True):
-    hutubs_dataset.normalized_dataset.pop(idx)
-
-
-subject_idx = 1
-measurement_point = 9
-
-data_point = hutubs_dataset[subject_idx * 440 + measurement_point]
-#print("HRTF shape: ", data_point['hrtf'].shape)
-#print("HRTF shape: ", data_point['hrtf'])
-
-#plt.figure(figsize=(14, 5))
-#plt.plot(data_point['hrtf'][0],label='L', linewidth=0.5, marker='o', markersize=1)
-#plt.plot(data_point['hrtf'][1],label='R', linewidth=0.5, marker='o', markersize=1)
-#plt.xlim([0,256])
-#plt.title(f'Subject: {data_point["subject_id"]}, Position: {data_point["measurement_point"]}')
-#plt.legend()
-#plt.show()
 
 def collate_fn(batch):
 
     audio_batch = [item['hrtf'] for item in batch]
     subject_id_batch = [item['subject_id'] for item in batch]
-    measurement_point_batch = [item['measurement_point'] for item in batch]
+    point_batch = [item['point'] for item in batch]
+    azimuth_batch = [item['azimuth'] for item in batch]
+    elevation_batch = [item['elevation'] for item in batch]
     head_measurements_batch = [item['head_measurements']for item in batch]
     ear_measurements_batch = [item['ear_measurements'] for item in batch]
 
     return {'hrtf': torch.stack(audio_batch),
-            'measurement_point': torch.tensor(measurement_point_batch),
+            'point': torch.tensor(point_batch),
+            'azimuth': torch.tensor(azimuth_batch),
+            'elevation': torch.tensor(elevation_batch),
             'subject_id': torch.LongTensor(subject_id_batch),
             'head_measurements': torch.stack(head_measurements_batch),
-            'ear_measurements': torch.stack(ear_measurements_batch)
+            'ear_measurements': torch.stack(ear_measurements_batch),
             }
