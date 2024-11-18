@@ -5,20 +5,22 @@ import pandas as pd
 from torch.utils.data import Dataset
 from pysofaconventions import *
 import numpy as np
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 
 class HUTUBSDataset(Dataset):
-    def __init__(self, hrtf_directory, anthro_csv_path, val_sub_idx):
+    def __init__(self, hrtf_directory, anthro_csv_path, val_sub_idx, pad_size=10):
         self.hrtf_directory = hrtf_directory
         self.anthro_csv_path = anthro_csv_path
         self.val_sub_idx = val_sub_idx
+        self.pad_size = pad_size
         self.load_data()
 
+    def pad_audio(self, audio):
+        return F.pad(audio, (self.pad_size, self.pad_size), mode='reflect')
     def load_data(self):
-        #excluded_subjects = [18, 79, 92]
         subject = []
-        angles = set()
         hrtf_points = []
         hrtf_lo = []
         for n in range(1, 97):
@@ -26,8 +28,6 @@ class HUTUBSDataset(Dataset):
 
             sofa = SOFAFile(file_path, 'r')
             sourcePositions = sofa.getVariableValue('SourcePosition')
-            #print("Source Positions")
-            #print(sourcePositions)
             subject.append(sofa)
         m = 0
         mn = 0
@@ -40,13 +40,13 @@ class HUTUBSDataset(Dataset):
                     p = sourcePositions[point]
                     azimuth = p[0]
                     elevation = p[1]
-                    if elevation ==0:
+                    if elevation == 0:
                         angle +=1
                         hrtf_point = hrtf_data[point, :, :]
-                        hrtf_point = hrtf_point.data
+                        hrtf_point = self.pad_audio(torch.from_numpy(hrtf_point.data))
                         if np.isnan(hrtf_point.any()):
                             print(f"nan detected at subject: {n} point: {point}")
-                        hrtf_points.append({'hrtf': hrtf_point, 'point': angle, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': m})
+                        hrtf_points.append({'hrtf': hrtf_point, 'point': point, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': m})
 
             if n == self.val_sub_idx:
                  mn += 1
@@ -55,22 +55,18 @@ class HUTUBSDataset(Dataset):
                     p = sourcePositions[point]
                     azimuth = p[0]
                     elevation = p[1]
+                    print(f'position: {point}, direction: {p}')
                     if elevation == 0:
                         angle += 1
-                        #print(angle)
-                        #angles.add(azimuth)
-                        #print(len(angles))
-                        #print(azimuth)
-                        #print(elevation)
                         hrtf_point = hrtf_data[point, :, :]
-                        hrtf_point = hrtf_point.data
+                        hrtf_point = self.pad_audio(torch.from_numpy(hrtf_point.data))
                         if np.isnan(hrtf_point.any()):
                             print(f"nan detected at subject: {n} point: {point}")
-                        hrtf_lo.append({'hrtf': hrtf_point, 'point': angle, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': mn})
+                        hrtf_lo.append({'hrtf': hrtf_point, 'point': point, 'azimuth': azimuth, 'elevation': elevation, 'subj': n, 'subj_2': mn})
 
 
-        self.all_hrtf_data = torch.from_numpy(np.array([item['hrtf'] for item in hrtf_points]))
-        self.lo_hrtf_data = torch.from_numpy(np.array([item['hrtf'] for item in hrtf_lo]))
+        self.all_hrtf_data = torch.stack([item['hrtf'] for item in hrtf_points])
+        self.lo_hrtf_data = torch.stack([item['hrtf'] for item in hrtf_lo])
         self.combined_hrtf_data = torch.cat((self.all_hrtf_data, self.lo_hrtf_data), dim=0)
         self.global_mean = torch.mean(self.combined_hrtf_data)
         self.global_std = torch.std(self.combined_hrtf_data)
@@ -78,24 +74,18 @@ class HUTUBSDataset(Dataset):
         af_csv = pd.read_csv(self.anthro_csv_path, header=0)
         self.sub_lo = torch.tensor(af_csv.iloc[self.val_sub_idx, 0])
         self.head_lo = torch.from_numpy(af_csv.iloc[self.val_sub_idx, 1:14].values)
-        self.ears_lo = torch.from_numpy(af_csv.iloc[self.val_sub_idx, 26:].values)
+        self.ears_lo = torch.from_numpy(af_csv.iloc[self.val_sub_idx, 14:26].values)
         subs_to_delete = torch.tensor([17, 78, 91])
         self.subject_ids = torch.from_numpy(np.delete(af_csv.iloc[:, 0].values, subs_to_delete, axis=0))
-        #print(len(self.subject_ids))
-        #print(self.subject_ids)
         self.head_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 1:14].values, subs_to_delete, axis=0))
         self.ear_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 26:].values, subs_to_delete, axis=0))
         self.anthro_measurements = torch.from_numpy(np.delete(af_csv.iloc[:, 1:].values, subs_to_delete, axis=0))
         self.anthro_mean = torch.mean(self.anthro_measurements)
         self.anthro_std = torch.std(self.anthro_measurements)
-        #self.global_head_mean = torch.mean(self.head_measurements)
-        #self.global_head_std = torch.std(self.head_measurements)
-        #self.global_ears_mean = torch.mean(self.ear_measurements)
-        #self.global_ears_std = torch.std(self.ear_measurements)
 
         self.normalized_dataset = [
             {
-                'hrtf': (torch.from_numpy(item['hrtf']) - self.global_mean) / self.global_std,
+                'hrtf': (item['hrtf'] - self.global_mean) / self.global_std,
                 'point': item['point'],
                 'subject_id': item['subj'] + 1,
                 'azimuth': item['azimuth'],
@@ -112,7 +102,7 @@ class HUTUBSDataset(Dataset):
         self.leave_out_subject = [
 
             {
-            'hrtf': (torch.from_numpy(item['hrtf']) - self.global_mean) / self.global_std,
+            'hrtf': (item['hrtf'] - self.global_mean) / self.global_std,
             'point': item['point'],
             'subject_id': item['subj'] + 1,
             'azimuth': item['azimuth'],
@@ -137,6 +127,12 @@ class HUTUBSDataset(Dataset):
         elif idx == 1:
             return self.leave_out_subject
 
+hutubs_dataset = HUTUBSDataset(
+                hrtf_directory='/nas/home/jalbarracin/datasets/HUTUBS/HRIRs',
+                anthro_csv_path='/nas/home/jalbarracin/datasets/HUTUBS/AntrhopometricMeasures.csv',
+                val_sub_idx=1,
+                pad_size=10
+            )
 
 def collate_fn(batch):
 

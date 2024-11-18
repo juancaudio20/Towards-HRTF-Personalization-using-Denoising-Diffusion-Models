@@ -1,13 +1,13 @@
 import torch
 from torch import nn
 import math
-import numpy as np
 from tqdm import tqdm
+import torch.nn.functional as F
 
 
 
 class DiffusionModel:
-    def __init__(self, noise_steps=300, beta_start=0.0001, beta_end=0.02, device="cuda"):
+    def __init__(self, noise_steps=600, beta_start=0.0001, beta_end=0.02, device="cuda"):
         self.noise_steps = noise_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
@@ -36,8 +36,7 @@ class DiffusionModel:
         ears_embedding = kwargs.get('ears_embedding', None)
         cfg_scale = 1
         model.eval()
-        with torch.no_grad():
-            #x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+        with torch.inference_mode():
             for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
                 t = (torch.ones(len(labels)) * i).long().to(self.device)
                 predicted_noise = model(x, t, labels=labels, head_embedding=head_embedding, ears_embedding=ears_embedding)
@@ -78,13 +77,41 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
         return embeddings
 
+class SelfAttention(nn.Module):
+    def __init__(self, channels, dropout_prob=0.2):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True, dropout=dropout_prob)
+        self.ln = nn.LayerNorm(channels)
+        self.attn_dropout = nn.Dropout(dropout_prob)
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm(channels),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Dropout(dropout_prob),
+            nn.Linear(channels, channels),
+            nn.Dropout(dropout_prob)
+        )
 
+    def forward(self, x):
+
+        x = x.permute(0, 2, 1)
+
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = self.attn_dropout(attention_value)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+
+        attention_value = attention_value.permute(0, 2, 1)
+
+        return attention_value
 
 
 
 class Block(nn.Module):
     def __init__(self, channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding,
-                 num_filters=3, downsample=True, dropout_prob=0.0):
+                 kernel_size=3, downsample=True, dropout_prob=0.0):
         super().__init__()
 
         self.time_embedding_dims = time_embedding_dims
@@ -98,17 +125,19 @@ class Block(nn.Module):
 
         self.downsample = downsample
 
+        padding = kernel_size // 2
+
         if downsample:
-            self.conv1 = nn.Conv1d(channels_in, channels_out, num_filters, padding=1)
+            self.conv1 = nn.Conv1d(channels_in, channels_out, kernel_size, padding=padding)
             self.final = nn.Conv1d(channels_out, channels_out, 4, 2, 1)
         else:
-            self.conv1 = nn.Conv1d(2 * channels_in, channels_out, num_filters, padding=1)
+            self.conv1 = nn.Conv1d(2 * channels_in, channels_out, kernel_size, padding=padding)
             self.final = nn.ConvTranspose1d(channels_out, channels_out, 4, 2, 1)
 
         self.bnorm1 = nn.BatchNorm1d(channels_out)
         self.bnorm2 = nn.BatchNorm1d(channels_out)
 
-        self.conv2 = nn.Conv1d(channels_out, channels_out, 3, padding=1)
+        self.conv2 = nn.Conv1d(channels_out, channels_out, kernel_size, padding=1)
         self.time_mlp = nn.Linear(time_embedding_dims, channels_out)
 
         if ears_embedding:
@@ -144,10 +173,9 @@ class Block(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, audio_channels=1, time_embedding_dims=128, labels=False, ears_embedding=False, head_embedding=False, sequence_channels=(4, 8, 16, 32, 64, 128, 256), dropout_prob=0.0):
+    def __init__(self, audio_channels=1, time_embedding_dims=128, labels=False, ears_embedding=False, head_embedding=False, sequence_channels=(4, 8, 16, 32, 64, 128), dropout_prob=0.0):
         super().__init__()
         self.time_embedding_dims = time_embedding_dims
-        sequence_channels_rev = reversed(sequence_channels)
 
         self.downsampling = nn.ModuleList(
             [Block(channels_in, channels_out, time_embedding_dims, labels, head_embedding, ears_embedding, dropout_prob=dropout_prob) for
@@ -157,17 +185,24 @@ class UNet(nn.Module):
         self.conv1 = nn.Conv1d(audio_channels, sequence_channels[0], 3, padding=1)
         self.conv2 = nn.Conv1d(sequence_channels[0], audio_channels, 1)
 
+        self.attentions = nn.ModuleList([SelfAttention(channels_out, dropout_prob) for channels_out in sequence_channels[:-1]])
+
     def forward(self, x, t, **kwargs):
         residuals = []
-        #print("x", x.shape)
         o = self.conv1(x)
-        #print("o", o.shape)
         for ds in self.downsampling:
             o = ds(o, t, **kwargs)
             residuals.append(o)
-        for us, res in zip(self.upsampling, reversed(residuals)):
-            #print("o",o.shape)
-            #print("res", res.shape)
+
+        for us, res, attention in zip(self.upsampling, reversed(residuals), reversed(self.attentions)):
+            if o.shape[2] != res.shape[2]:
+                if o.shape[2] < res.shape[2]:
+                    padding = res.shape[2] - o.shape[2]
+                    o = F.pad(o, (0, padding))
+                else:
+                    padding = o.shape[2] - res.shape[2]
+                    res = attention(F.pad(res, (0, padding)))
+
             o = us(torch.cat((o, res), dim=1), t, **kwargs)
 
         return self.conv2(o)
