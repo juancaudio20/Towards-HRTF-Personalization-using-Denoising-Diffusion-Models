@@ -1,3 +1,4 @@
-# HRTF-with-ddpm
+# Towards HRTF Personalization using Denoising Diffusion Models
+
 
 
